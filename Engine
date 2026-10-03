@@ -1,0 +1,168 @@
+import json, subprocess, os, cv2, numpy as np
+from scipy.signal import find_peaks
+
+def sh(c): return subprocess.run(c, capture_output=True, check=True)
+
+def probe(p):
+    j = json.loads(sh(['ffprobe','-v','error','-print_format','json','-show_format','-show_streams',p]).stdout)
+    v = next((s for s in j['streams'] if s['codec_type']=='video'), None)
+    r = dict(duration=float(j['format']['duration']), audio=any(s['codec_type']=='audio' for s in j['streams']))
+    if v:
+        n, d = map(int, v['r_frame_rate'].split('/')); r.update(width=v['width'], height=v['height'], fps=round(n/max(d,1),2))
+    return r
+
+# ---------- analysis ----------
+def scan(p, rate=10):
+    """rows: t, histogram diff, abs frame diff, luma delta, global shift (phase correlation)"""
+    cap = cv2.VideoCapture(p); fps = cap.get(5) or 30; k = max(1, round(fps/rate)); i = 0; prev = None; R = []
+    while cap.grab():
+        if i % k == 0:
+            ok, f = cap.retrieve()
+            if not ok: break
+            s = cv2.resize(f, (96, 54)); g = cv2.cvtColor(s, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            h = cv2.calcHist([s],[0,1,2],None,[8,8,8],[0,256]*3); h = cv2.normalize(h,h).flatten()
+            if prev is None: R.append((i/fps,0,0,0,0))
+            else:
+                (dx,dy),_ = cv2.phaseCorrelate(prev[0], g)
+                R.append((i/fps, float(cv2.compareHist(prev[1],h,cv2.HISTCMP_BHATTACHARYYA)),
+                          float(np.abs(g-prev[0]).mean()), float(g.mean()-prev[0].mean()), float(np.hypot(dx,dy))))
+            prev = (g, h)
+        i += 1
+    return np.array(R), i/fps
+
+def beats(p):
+    raw = subprocess.run(['ffmpeg','-v','error','-i',p,'-vn','-ac','1','-ar','11025','-f','s16le','-'], capture_output=True).stdout
+    x = np.frombuffer(raw, np.int16).astype(np.float32)
+    if len(x) < 22050: return dict(bpm=None, beats=[])
+    hop = 256; n = len(x)//hop; e = np.sqrt((x[:n*hop].reshape(n,hop)**2).mean(1))
+    o = np.maximum(np.diff(e, prepend=e[0]), 0); o /= o.max()+1e-9; fr = 11025/hop
+    pk,_ = find_peaks(o, height=0.25, distance=max(1,int(fr*0.25)))
+    a = o-o.mean(); ac = np.correlate(a,a,'full')[len(a)-1:]
+    lo, hi = int(fr*60/200), min(int(fr*60/70), len(ac)-1)
+    bpm = 60*fr/(lo+int(np.argmax(ac[lo:hi]))) if hi > lo else None
+    return dict(bpm=round(bpm,1) if bpm else None, beats=[round(float(i/fr),3) for i in pk])
+
+def analyze_reference(p, rng=None):
+    info = probe(p); R, dur = scan(p)
+    t0, t1 = rng or (0, dur)
+    R = R[(R[:,0] >= t0) & (R[:,0] <= t1)]
+    d = R[:,1]; thr = max(0.3, min(0.5, d.mean()+4*d.std()))
+    cuts = [float(R[i,0]) for i in range(1,len(R)-1) if d[i] > thr and d[i] >= d[i-1] and d[i] >= d[i+1]]
+    cl = []
+    for c in cuts:
+        if not cl or c-cl[-1] >= 0.25: cl.append(c)
+    edges = [t0] + cl + [t1]; segs = []; flashes = []
+    for i in range(len(R)):  # flash = big luma jump that is not a cut
+        if abs(R[i,3]) > 18 and d[i] < thr: flashes.append(float(R[i,0]))
+    for a, b in zip(edges[:-1], edges[1:]):
+        if b-a < 0.15: continue
+        m = (R[:,0] >= a) & (R[:,0] < b)
+        segs.append(dict(start=round(a-t0,3), end=round(b-t0,3), motion=float(R[m,2].mean()) if m.any() else 0,
+                         shake=float(R[m,4].mean()) if m.any() else 0,
+                         flashes=[round(f-a,3) for f in flashes if a <= f < b]))
+    aud = beats(p) if info['audio'] else dict(bpm=None, beats=[])
+    ms = [s['motion'] for s in segs]
+    return dict(analysisVersion='1.0', reference=dict(info, duration=round(t1-t0,3)), segments=segs, audio=aud,
+        editingStyle=dict(avgClip=round(float(np.mean([s['end']-s['start'] for s in segs])),3), cuts=len(segs)-1,
+                          flashCount=len(flashes), avgShake=round(float(np.mean([s['shake'] for s in segs])),3),
+                          pace='fast' if np.mean([s['end']-s['start'] for s in segs]) < 1.5 else 'moderate'),
+        unsupportedDetection=['zoom','speed ramps','RGB split','motion blur','text'],
+        confidence=dict(cuts='histogram threshold: medium', shake='phase-correlation estimate: low-medium', flash='luma-jump: medium'))
+
+def analyze_clip(p):
+    info = probe(p); R, dur = scan(p)
+    return dict(info=info, t=[round(float(x),2) for x in R[:,0]], m=[round(float(x),3) for x in R[:,2]])
+
+# ---------- matching / timeline ----------
+def cands(clips, d, used, step=0.25):
+    out = []
+    for c in clips:
+        t, m = np.array(c['t']), np.array(c['m']); dur = c['info']['duration']
+        if dur < d - 0.02: continue
+        for s in np.arange(0, max(dur-d, 0)+1e-6, step):
+            if any(u[0]==c['id'] and s < u[2] and s+d > u[1] for u in used): continue
+            k = (t >= s) & (t <= s+d); out.append((c['id'], float(s), float(m[k].mean()) if k.any() else 0.0))
+    return sorted(out, key=lambda x: x[2])
+
+def pick(clips, d, used, pct, notes):
+    cs = cands(clips, d, used)
+    if cs:
+        cid, s, _ = cs[int(round(pct*(len(cs)-1)))]; return dict(clip=cid, sourceStart=s, sourceEnd=s+d, speed=1.0)
+    best = max(clips, key=lambda c: c['info']['duration']); span = min(best['info']['duration'], d)
+    notes.append(f"No source long enough for a {d:.2f}s slot; stretched {span:.2f}s of '{best['name']}' (slow motion).")
+    return dict(clip=best['id'], sourceStart=0.0, sourceEnd=span, speed=span/d)
+
+def build(bp, clips, mode, P, music_beats, target=None):
+    notes, used, tl = [], [], []
+    st = bp['editingStyle']; segs = bp['segments']
+    ranks = np.argsort(np.argsort([s['motion'] for s in segs])) / max(len(segs)-1, 1)
+    if mode == 'exact':
+        slots = [(s['start'], s['end'], float(ranks[i]), s) for i, s in enumerate(segs)]
+    else:
+        total = target or bp['reference']['duration']; avg = max(0.4, st['avgClip']*P['pace']); cuts = [0.0]
+        if music_beats:
+            for b in music_beats:
+                if b < total-0.3 and b-cuts[-1] >= avg*0.8: cuts.append(b)
+        else:
+            while cuts[-1]+avg < total-0.3: cuts.append(round(cuts[-1]+avg, 3))
+        cuts.append(total); n = len(cuts)-1
+        slots = [(cuts[i], cuts[i+1], min(1.0, 0.5+0.5*((i*0.618) % 1.0)), None) for i in range(n)]
+    for i, (a, b, pct, s) in enumerate(slots):
+        d = b-a; ev = dict(id=f'event_{i:03d}', start=round(a,3), end=round(b,3), effects=[], **pick(clips, d, used, pct, notes))
+        used.append((ev['clip'], ev['sourceStart'], ev['sourceEnd']))
+        if mode == 'exact':
+            sh = min(1, s['shake']/1.5)*P['shake']
+            if sh > 0.15: ev['effects'].append(dict(type='camera_shake', start=0, end=round(d,3), intensity=round(min(sh,1),2), confidence=0.5))
+            for f in s['flashes']:
+                if P['flash'] > 0: ev['effects'].append(dict(type='white_flash', start=f, end=round(min(f+0.12,d),3), intensity=0.8*min(P['flash'],1.25), confidence=0.6))
+        else:
+            if pct > 0.66: ev['effects'].append(dict(type='camera_shake', start=0, end=round(d,3), intensity=round(min(1,max(0.3, st['avgShake']/1.5)*P['shake']),2)))
+            if i % 2 == 0: ev['effects'].append(dict(type='zoom_in', start=0, end=round(d,3), intensity=round(min(1,0.35*P['zoom']),2)))
+            if i % 4 == 0 and i and P['flash'] > 0: ev['effects'].append(dict(type='white_flash', start=0, end=0.1, intensity=0.7*min(P['flash'],1.25)))
+        tl.append(ev)
+    notes.append('Unsupported and not applied: zoom detection for Exact mode, speed ramps, RGB split, motion blur, text.') if mode == 'exact' else None
+    sync = None
+    if music_beats:
+        cuts = [e['start'] for e in tl[1:]]
+        sync = round(sum(any(abs(c-b) < 0.08 for b in music_beats) for c in cuts)/max(len(cuts),1), 2)
+    rep = dict(mode=mode, cuts=len(tl)-1, effectsApplied=sorted({f['type'] for e in tl for f in e['effects']}),
+               cutsOnBeat=sync, notes=notes)
+    if mode == 'exact':
+        rep['timelineSimilarity'] = 'cut times and durations copied exactly from detected cuts (detection itself is approximate)'
+    return tl, rep
+
+# ---------- render ----------
+def seg_filter(ev, W, H, fps, grade=True):
+    d = ev['end']-ev['start']; f = [f"trim=start={ev['sourceStart']:.3f}:end={ev['sourceEnd']:.3f}", f"setpts=(PTS-STARTPTS)/{ev['speed']:.4f}",
+        f"scale={int(W*1.25)//2*2}:{int(H*1.25)//2*2}:force_original_aspect_ratio=increase", f"crop={int(W*1.25)//2*2}:{int(H*1.25)//2*2}", 'setsar=1']
+    z = next((e for e in ev['effects'] if e['type']=='zoom_in'), None)
+    if z:
+        zs, ze = z['start'], max(z['end'], z['start']+0.05)
+        f.append(f"scale=w='trunc(iw*(1+{z['intensity']*0.5}*clip((t-{zs})/{ze-zs},0,1))/2)*2':h='trunc(ih*(1+{z['intensity']*0.5}*clip((t-{zs})/{ze-zs},0,1))/2)*2':eval=frame")
+    sk = next((e for e in ev['effects'] if e['type']=='camera_shake'), None)
+    A = f"{sk['intensity']*0.05*W:.1f}*between(t,{sk['start']},{sk['end']})" if sk else '0'
+    f.append(f"crop={W}:{H}:x='(in_w-{W})/2+{A}*sin(t*47)':y='(in_h-{H})/2+{A}*cos(t*61)'")
+    for e in ev['effects']:
+        if e['type']=='white_flash':
+            s, en = e['start'], max(e['end'], e['start']+0.05)
+            f.append(f"eq=brightness='{e['intensity']}*between(t,{s},{en})*(1-(t-{s})/{en-s})':eval=frame")
+    if grade: f.append('eq=contrast=1.08:saturation=1.12')
+    f += [f'fps={fps}', 'format=yuv420p']
+    return ','.join(f)
+
+def render(tl, clips, out, W, H, fps, music, workdir, progress):
+    byid = {c['id']: c for c in clips}; parts = []
+    for i, ev in enumerate(tl):
+        progress(f'Rendering segment {i+1}/{len(tl)}'); o = os.path.join(workdir, f'seg{i}.mp4'); d = ev['end']-ev['start']
+        sh(['ffmpeg','-y','-i',byid[ev['clip']]['path'],'-vf',seg_filter(ev,W,H,fps),'-an','-t',f'{d:.3f}','-c:v','libx264','-preset','veryfast','-crf','20',o]); parts.append(o)
+    lst = os.path.join(workdir, 'list.txt'); open(lst,'w').write(''.join(f"file '{p}'\n" for p in parts))
+    T = tl[-1]['end']; progress('Finalizing')
+    if music:
+        sh(['ffmpeg','-y','-f','concat','-safe','0','-i',lst,'-i',music,'-filter_complex',
+            f'[1:a]atrim=0:{T},afade=t=in:d=0.3,afade=t=out:st={max(T-0.6,0):.2f}:d=0.6,alimiter=limit=0.9[a]','-map','0:v','-map','[a]',
+            '-c:v','copy','-c:a','aac','-t',f'{T:.3f}',out])
+    else: sh(['ffmpeg','-y','-f','concat','-safe','0','-i',lst,'-c','copy',out])
+    v = probe(out); sh(['ffmpeg','-v','error','-i',out,'-f','null','-'])  # raises if undecodable
+    assert abs(v['duration']-T) < 0.5, f"duration {v['duration']} != {T}"
+    assert (v['width'], v['height']) == (W, H) and (v['audio'] or not music), 'output validation failed'
+    return v
