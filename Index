@@ -1,0 +1,58 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RE-EDIT AI</title><style>
+:root{--bg:#0c0c12;--s1:#15151f;--s2:#1d1d2b;--tx:#f4f4fb;--mu:#9a9ab5;--p:#8b5cf6;--b:#3b82f6;--er:#f87171;--ok:#4ade80}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 400px at 80% -10%,#2a1b5a55,transparent),var(--bg);color:var(--tx);font:16px/1.5 system-ui,sans-serif}
+main{max-width:760px;margin:0 auto;padding:16px 16px 80px}h1{font-size:22px;margin:8px 0 2px;letter-spacing:.5px}.sub{color:var(--mu);margin:0 0 18px;font-size:14px}
+.card{background:var(--s1);border:1px solid #ffffff12;border-radius:14px;padding:16px;margin:12px 0}h2{font-size:17px;margin:0 0 10px}
+button,.btn{background:linear-gradient(90deg,var(--p),var(--b));color:#fff;border:0;border-radius:10px;padding:12px 18px;font:600 15px inherit;cursor:pointer;min-height:44px}
+button.g{background:var(--s2)}button:disabled{opacity:.5}input,select,textarea{width:100%;background:var(--s2);color:var(--tx);border:1px solid #ffffff1a;border-radius:10px;padding:12px;font:inherit;min-height:44px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.row>*{flex:1 1 140px}.drop{border:2px dashed #ffffff33;border-radius:12px;padding:22px;text-align:center;color:var(--mu)}.drop.on{border-color:var(--p);background:#8b5cf611}
+.item{display:flex;gap:10px;justify-content:space-between;align-items:center;padding:8px 0;border-top:1px solid #ffffff0f;font-size:14px}.mu{color:var(--mu);font-size:13px}.er{color:var(--er)}.ok{color:var(--ok)}
+video{width:100%;max-height:60vh;border-radius:10px;background:#000}.modes{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.mode{border:2px solid #ffffff1a;border-radius:12px;padding:14px;cursor:pointer;background:var(--s2)}.mode.sel{border-color:var(--p);background:#8b5cf622}.mode b{display:block;margin-bottom:4px}
+.tl{display:flex;height:34px;border-radius:8px;overflow:hidden;background:var(--s2);margin:8px 0}.tl div{border-right:1px solid var(--bg);background:linear-gradient(var(--p),#5b3fb5);font-size:10px;overflow:hidden;padding:2px}
+.stage{font-weight:600}.proj{cursor:pointer}pre{white-space:pre-wrap;font-size:12px;color:var(--mu);margin:0}a{color:#93c5fd}
+:focus-visible{outline:2px solid var(--b);outline-offset:2px}
+</style></head><body><main>
+<h1>RE-EDIT AI</h1><p class="sub">Your reference. Your footage. Your AI editor.</p>
+<div id="app"></div></main><script>
+const $=s=>document.querySelector(s),A=$('#app');let P=null,mode='exact',poll=null,busy={};
+const api=async(u,o={})=>{const r=await fetch(u,o);const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.statusText);return j};
+const post=(u,b)=>api(u,{method:'POST',body:JSON.stringify(b||{})});
+const fmt=i=>i.width?`${i.width}×${i.height} · ${i.fps}fps · ${i.duration.toFixed(1)}s ${i.audio?'· audio':'· no audio'}`:`${i.duration.toFixed(1)}s audio`;
+async function home(){clearInterval(poll);P=null;const{projects}=await api('/api/projects');
+ const n=projects.length,done=projects.filter(p=>p.job.stage=='Completed').length,run=projects.filter(p=>p.job.running).length,ex=projects.reduce((a,p)=>a+(p.exports||[]).length,0);
+ A.innerHTML=`<div class="card"><h2>New project</h2><div class="row"><input id="nm" placeholder="Project name"><select id="ar"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select><button onclick="create()">Create new edit</button></div></div>
+ <div class="card"><h2>Workspace</h2><div class="mu">${n} projects · ${done} completed · ${run} processing · ${ex} exported videos</div>
+ ${projects.map(p=>`<div class="item"><span class="proj" onclick="open_('${p.id}')"><b>${esc(p.name)}</b><br><span class="mu">${p.aspect} · ${p.mode||'no mode yet'} · ${p.job.stage} · ${new Date(p.modified*1000).toLocaleString()}</span></span><span class="row" style="flex:0 0 auto"><button class="g" onclick="ren('${p.id}')">Rename</button><button class="g" onclick="del('${p.id}')">Delete</button></span></div>`).join('')||'<p class="mu">No projects yet. Create one to start.</p>'}</div>`}
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function create(){const p=await post('/api/p',{name:$('#nm').value,aspect:$('#ar').value});open_(p.id)}
+async function ren(id){const n=prompt('New name');if(n){await post(`/api/p/${id}/rename`,{name:n});home()}}
+async function del(id){if(confirm('Delete this project and all its media? This cannot be undone.')){await api('/api/p/'+id,{method:'DELETE'});home()}}
+async function open_(id){P=await api('/api/p/'+id);draw();clearInterval(poll);poll=setInterval(refresh,1500)}
+async function refresh(){if(!P)return;const was=P.job.running;const n=await api('/api/p/'+P.id);const ch=JSON.stringify(n.job)!=JSON.stringify(P.job)||n.media.length!=P.media.length;P=n;if(ch||was)draw()}
+function upload(kind,files){[...files].forEach(f=>{const id=Math.random();busy[id]=f.name;draw();const x=new XMLHttpRequest();x.open('PUT',`/api/p/${P.id}/upload?kind=${kind}&name=${encodeURIComponent(f.name)}`);
+ x.upload.onprogress=e=>{busy[id]=`${f.name} ${Math.round(100*e.loaded/e.total)}%`;$('#bz')&&($('#bz').innerHTML=Object.values(busy).join('<br>'))};
+ x.onload=()=>{delete busy[id];if(x.status==200)P=JSON.parse(x.responseText);else alert(JSON.parse(x.responseText).error);draw()};x.onerror=()=>{delete busy[id];alert('Upload failed. Check your connection and try again.');draw()};x.send(f)})}
+function dz(kind,label,acc){return `<div class="drop" ondragover="event.preventDefault();this.classList.add('on')" ondragleave="this.classList.remove('on')" ondrop="event.preventDefault();upload('${kind}',event.dataTransfer.files)">${label}<br><input type="file" ${kind=='clip'?'multiple':''} accept="${acc}" onchange="upload('${kind}',this.files)" style="margin-top:8px"></div>`}
+function media(k){return P.media.filter(m=>m.kind==k).map(m=>`<div class="item"><span>${esc(m.name)}<br><span class="mu">${fmt(m.info)}${m.analyzed?' · analyzed':''}${m.excluded?' · excluded':''}</span></span>${k=='clip'?`<button class="g" onclick="tog('${m.id}')">${m.excluded?'Include':'Exclude'}</button>`:''}</div>`).join('')}
+async function tog(id){P=await post(`/api/p/${P.id}/clip/toggle`,{id});draw()}
+function draw(){const j=P.job,ready=P.media.some(m=>m.kind=='ref')&&P.media.some(m=>m.kind=='clip');const bz=Object.keys(busy).length?`<div class="mu" id="bz">${Object.values(busy).join('<br>')}</div>`:'';
+ let h=`<button class="g" onclick="home()">← Projects</button><h2 style="margin-top:12px">${esc(P.name)} <span class="mu">${P.aspect}</span></h2>
+ <div class="card"><h2>1. Reference video</h2>${dz('ref','Drop the video whose edit you want to copy','video/*')}${media('ref')}</div>
+ <div class="card"><h2>2. Your footage</h2>${dz('clip','Drop your clips (multiple allowed)','video/*')}${media('clip')}</div>
+ <div class="card"><h2>3. Music (optional)</h2>${dz('music','Drop a music track','audio/*')}${media('music')}${bz}</div>
+ <div class="card"><h2>4. Editing mode</h2><div class="modes"><div class="mode ${mode=='exact'?'sel':''}" onclick="mode='exact';draw()"><b>Exact recreation</b><span class="mu">Copies the reference's cut timing, shake and flashes onto your footage.</span></div>
+ <div class="mode ${mode=='creative'?'sel':''}" onclick="mode='creative';draw()"><b>Creative recreation</b><span class="mu">New sequence in the reference's pace, cut to your music's beats.</span></div></div>
+ <div class="row" style="margin-top:12px"><input id="tg" type="number" step="0.5" placeholder="Target seconds (creative, optional)"><button id="go" ${(!ready||j.running)?'disabled':''} onclick="gen()">Generate</button></div></div>`;
+ if(j.stage!='Created')h+=`<div class="card"><h2>Status</h2><div class="stage ${j.error?'er':j.stage=='Completed'?'ok':''}">${j.running?'⏳ ':''}${esc(j.stage)}</div>${j.error?`<p class="er">${esc(j.error)}</p><p class="mu">Completed analysis is kept. Press Generate to retry.</p>`:''}</div>`;
+ if(P.latest&&!j.running){const T=P.timeline[P.timeline.length-1].end,r=P.report;
+  h+=`<div class="card"><h2>Result</h2><video controls playsinline src="/api/p/${P.id}/video?f=${P.latest}&t=${P.exports.length}"></video><p><a class="btn" style="display:inline-block;text-decoration:none" href="/api/p/${P.id}/export?f=${P.latest}">Download MP4</a></p>
+  <div class="tl">${P.timeline.map(e=>`<div style="flex:${e.end-e.start}" title="${e.effects.map(x=>x.type).join(', ')}">${e.effects.map(x=>x.type[0].toUpperCase()).join('')}</div>`).join('')}</div><div class="mu">S = shake · Z = zoom · W = flash</div>
+  <h2 style="margin-top:12px">Edit report</h2><pre>Mode: ${r.mode}\nCuts: ${r.cuts}\nEffects applied: ${r.effectsApplied.join(', ')||'none'}\nCuts landing on a music beat: ${r.cutsOnBeat==null?'n/a (no music)':Math.round(r.cutsOnBeat*100)+'%'}\n${r.timelineSimilarity?r.timelineSimilarity+'\n':''}${r.notes.join('\n')}</pre>
+  <h2 style="margin-top:12px">Request a change</h2><div class="row"><input id="mt" placeholder="e.g. make the shakes stronger"><button onclick="mod()">Apply</button></div><div class="mu" id="me">Versions saved: ${P.versionCount}</div></div>`}
+ if(P.blueprint){const b=P.blueprint,s=b.editingStyle;h+=`<div class="card"><h2>Reference analysis</h2><pre>${b.reference.width}×${b.reference.height} · ${b.reference.duration}s · ${b.reference.fps}fps\nCuts: ${s.cuts} · avg clip ${s.avgClip}s · pace ${s.pace}\nFlashes: ${s.flashCount} · avg shake estimate ${s.avgShake}\nBPM: ${b.audio.bpm||'n/a'}\nNot detected (unsupported): ${b.unsupportedDetection.join(', ')}</pre></div>`}
+ const keep=document.activeElement&&document.activeElement.id,v=keep&&document.activeElement.value;A.innerHTML=h;if(keep&&$('#'+keep)&&v)$('#'+keep).value=v}
+async function gen(){try{await post(`/api/p/${P.id}/generate`,{mode,target:parseFloat($('#tg').value)||null,reset:false});P=await api('/api/p/'+P.id);draw()}catch(e){alert(e.message)}}
+async function mod(){try{const r=await post(`/api/p/${P.id}/modify`,{text:$('#mt').value});P=await api('/api/p/'+P.id);draw()}catch(e){$('#me').textContent=e.message;$('#me').className='er'}}
+home()</script></body></html>
